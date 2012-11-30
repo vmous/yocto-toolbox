@@ -18,6 +18,12 @@ puts "Manipulating file " + name + " of extention " + extention
 case extention
 when ".zip"
     puts "Attempting to inflate zip file " + archive + "."
+    cmd = "unzip " + archive
+    if system(cmd)
+        puts "Command " + cmd + " successfully executed!"
+    else
+        puts "Command " + cmd + " failed to execute!"
+    end
 when ".rar"
     puts "Attempting to inflate rar file " + archive + "."
 when ".gz"
