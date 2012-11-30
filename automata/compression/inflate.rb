@@ -27,7 +27,7 @@ when ".zip"
 when ".rar"
     puts "Attempting to inflate rar file " + archive + "."
 when ".gz"
-    puts "Attempting to inflate gunzipped file " + archive + "."
+    puts "Attempting to inflate gzipped file " + archive + "."
     cmd = "gunzip " + archive
     if system(cmd)
         puts "Command " + cmd + " successfully executed!"
@@ -35,12 +35,16 @@ when ".gz"
         puts "Command " + cmd + " failed to execute!"
     end
 when ".7z"
-    puts "Attempting to inflate zip file " + archive + "."
+    puts "Attempting to inflate 7-zip file " + archive + "."
 when ".tgz"
-when ".tar.gz"
-    puts "Attempting to inflate gunzipped tarball file " + archive + "."
-when ".tar"
-    puts "Attempting to inflate  tarball file " + archive + "."
+#when ".tar.gz"
+    puts "Attempting to inflate gzipped tarball file " + archive + "."
+    cmd = "tar xzvf " + archive
+    if system(cmd)
+        puts "Command " + cmd + " successfully executed!"
+    else
+        puts "Command " + cmd + " failed to execute!"
+    end
 else
     puts "Cannot handle the extention type of archive " + archive + "."
 end
