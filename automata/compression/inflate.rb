@@ -35,7 +35,13 @@ when ".gz"
         puts "Command " + cmd + " failed to execute!"
     end
 when ".7z"
-    puts "Attempting to inflate 7-zip file " + archive + "."
+    puts "Attempting to inflate 7-zipped file " + archive + "."
+    cmd = "7za x " + archive
+    if system(cmd)
+        puts "Command " + cmd + " successfully executed!"
+    else
+        puts "Command " + cmd + " failed to execute!"
+    end
 when ".tgz"
 #when ".tar.gz"
     puts "Attempting to inflate gzipped tarball file " + archive + "."
