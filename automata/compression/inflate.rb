@@ -26,6 +26,12 @@ when ".zip"
     end
 when ".rar"
     puts "Attempting to inflate rar file " + archive + "."
+    cmd = "rar x " + archive
+    if system(cmd)
+        puts "Command " + cmd + " successfully executed!"
+    else
+        puts "Command " + cmd + " failed to execute!"
+    end
 when ".gz"
     puts "Attempting to inflate gzipped file " + archive + "."
     cmd = "gunzip " + archive
