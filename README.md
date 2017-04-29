@@ -1,4 +1,3 @@
-Automata
-========
-
-A set of automated jobs for administrative and/or every day tasks for a Linux (MacOS?) user.
+yocto-toolbox
+=============
+A set of scripts, utilities and libraries for automating every day _nix tasks.
