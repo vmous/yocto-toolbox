@@ -1,0 +1,29 @@
+namespace: 'foo'
+substitutions: 'bar'
+jobs:
+- name: job_1
+  dependencies:
+- name: job_2
+  dependencies:
+    - job_1
+- name: job_3
+  dependencies:
+    - job_1
+- name: job_4
+  dependencies:
+    - job_3
+- name: job_5
+  dependencies:
+    - job_3
+- name: job_6
+  dependencies:
+    - job_4
+    - job_5
+- name: job_7
+  dependencies:
+    - job_2
+    - job_6
+- name: job_8
+  dependencies:
+    - job_7
+- name: job_9

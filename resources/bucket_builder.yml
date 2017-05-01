@@ -1,0 +1,605 @@
+# -------------------------------------------------------------------------------------
+# The main driver .yml for the BDM bucketing build.
+#
+# Inputs:
+#   date                          : Date of the build
+#   env_root                      : Apollo environment root
+#   region                        : Region in uppercase
+#   region_lc                     : Region in lowercase
+#   stage                         : Apollo environment stage
+#   mid                           : The id of the marketplace to run for
+#   phrasedoc_org                 : The name that phrasedoc uses for this marketplace
+#   language                      : The primary language of the current
+#                                   marketplace to pass to text pipeline
+#   xdf_extracts_prod_instance    : the latest xdf extracts instance from prod.  This is only for test stages (so we can copy it to alpha).
+#   mdb_url                       : the mdb url to use to publish bdm_bucketer client flag to
+# -------------------------------------------------------------------------------------
+namespace         : 'bdm::bucketbuilder::bucketer::${mid}'
+instance          : '${date}'
+log_dir           : '${env_root}/var/hflow/log'
+
+substitutions:
+  dfs_root             : '/projects/bdm/bucketbuilder/bucketer/${date}/${region}/${mid}'
+  local_root           : '${env_root}/var/data/${date}/${region}/${mid}'
+  phrasedoc_dfs_root   : '/projects/phrasedoc/${phrasedoc_org}/${date}'
+  job_name_prefix      : 'bdm/bucketbuilder/${date}/${region}/${mid}'
+  odin_aws_key         : 'com.a9.relevance.common.aws'
+  odin_aws_bdm_crypt   : 'com.a9.relevance.bdm.crypt_keypair_${stage}'
+  xdf_extract_path     : '/projects/xdf_extracts/common_fields_variable_width/${region_lc}/{{eval_modules.get_latest_job_instance("xdf_field_extractor::common_fields_variable_width::${region_lc}","extract_xdf_field","com.a9.relevance.common.aws")}}'
+
+  # list of all fields to run stats for (this list is not related to competitor_bucket lists)
+  stats_fields         : [ {'field': 'artist'}, {'field': 'author'}, {'field': 'brand'}, {'field': 'main_title'} ]
+  
+  # the buckets for which to run the competitor bucketing strategy.  Do not 
+  # forget to also update bucket_join_chain and last_bucket_in_join below!
+  competitor_buckets   : [ {'bucket': 'author'}, {'bucket': 'artist'}, {'bucket': 'brand'} ]
+  # The bucket join order:
+  # for each new bucket repeat the last line, modify, and set 
+  # last_bucket_in_join to your new bucket.
+  # right now we have this order: artist -> author -> brand
+  # (note: one cannot have a token start with a % in yaml, so we could not just 
+  # have '- %{previous_job}' dependency.  So we had to make sure that the jobs
+  # have the same prefix.  'bucket_' was chosen.  So previous job is really
+  # only what comes after 'bucket_' in that job's name).
+  # The content of this list must match the competitor_buckets list above.
+  # NOTE: modifying these will NOT modify phrasedoc2 and widget datasets output
+  # by this build, so can be done even before we are ready to launch a new bucket.
+  bucket_join_chain    : [ {'previous_job': 'competitor_author', 'previous_data_set': 'bucketed_competitor_author', 'current_bucket': 'artist'}, 
+                           {'previous_job': 'join_add_artist', 'previous_data_set': 'bucketed_upto_artist', 'current_bucket': 'brand'}]
+  last_bucket_in_join  : 'brand'
+  
+  # Once you evaluate the results of the bucket and decide to push it, add it
+  # to the below list.  The format of each item is 
+  # bucket+BUCKETVALUE=marking_in_widget_dataset .  Multiple items should be
+  # separated by a semicolon.  Example:
+  #     'brand+COMPETITOR=b;author+COMPETITOR=at;artist+COMPETITOR=ar'
+  # For the filter_and_format_for_eds job the laast part, 
+  # "marking_in_widget_dataset" value does not matter.  For the widget dataset
+  # it does and will be published in the middle column.  If we want to have the
+  # row combined in the widget dataset, point two buckets to the same marker.
+  # Example:
+  #    author+COMPETITOR=at;artist+COMPETITOR=ar   (at and ar!)
+  #    -> when query has both types of association, will create two different 
+  #       rows.
+  #    author+COMPETITOR=a;artist+COMPETITOR=a     (both a)
+  #    -> when query has both types of association, will create only one row
+  #       with all ASINs together, mixed, sorted by score, and de-duped if needed.
+  # Feel free to split into separate variables if you need to differentiate 
+  # between filtering for EDS params and widget dataset params.
+  # NOTE: modifying this line WILL modify phrasedoc2 and widget datasets
+  # output by this build.
+  buckets_to_publish   : 'brand+COMPETITOR=b'
+
+aws:
+  odin-aws-key    : '${odin_aws_key}'
+  odin-crypt-key  : 'com.a9.relevance.common.crypt_keypair'
+  odin-ec2-key    : 'com.a9.relevance.common.emr_${stage}'
+  instance-count  : 30
+
+udf_jars:
+  - '${env_root}/lib/A9SearchBDMBucketBuilderPigUDF-1.0.jar'
+  - '${env_root}/lib/A9SearchPigUDF-2.0.jar'
+  - '${env_root}/lib/A9SearchTransliterationLibJava-1.0.jar'
+  - '${env_root}/lib/datafu-1.2.0.jar'
+  - '${env_root}/lib/JavaStanzaConfig-1.0.jar'
+  - '${env_root}/lib/piggybank.jar'
+  - '${env_root}/lib/sen.jar'
+
+sync_dirs:
+  - '${env_root}/bin/tp-tool'
+  - '${env_root}/config/stanza/text_pipeline_tool.stanza'
+
+jobs:
+# -------------------------------------------------------------------------------------
+# Setup directories
+# -------------------------------------------------------------------------------------
+- name: clean_dfs_root
+  type: local
+  exec: 'dfs_rmr_if_exists'
+  opts:
+    - '${dfs_root}'
+
+- name: clean_local_root
+  type: local
+  exec: 'rm -rf'
+  opts:
+    - '${local_root}'
+
+- name: mkdir_local_root_dirs
+  type: local
+  dependencies:
+    - clean_local_root
+  exec: 'mkdir -p'
+  opts:
+    - '${local_root}'
+    - '${local_root}/input'
+
+- name: dfs_mkdir_input
+  type: local
+  dependencies:
+    - clean_dfs_root
+  exec: 'dfs_mkdir_if_missing'
+  opts:
+    - '${dfs_root}/input'
+
+# -------------------------------------------------------------------------------------
+# Preprocess phrasedoc.
+# -------------------------------------------------------------------------------------
+- name: preprocess_phrasedoc
+  type: pig
+  dependencies:
+    - clean_dfs_root
+  script: '${env_root}/pig-scripts/preprocess_phrasedoc.pig'
+  inputs:
+    in_phrasedoc                 : '${phrasedoc_dfs_root}/post_process/phrasedoc_child_lines'
+  outputs:
+    out_phrasedoc                : '${dfs_root}/phrasedoc.gz'
+  params:
+    job_name                     : ${job_name_prefix}/preprocess_phrasedoc
+
+# -------------------------------------------------------------------------------------
+# Join Phrasedoc with XDF extracts to get ASIN data
+# -------------------------------------------------------------------------------------
+- name: add_asin_data
+  type: pig
+  dependencies:
+    - preprocess_phrasedoc
+  script: '${env_root}/pig-scripts/add_asin_data.pig'
+  inputs:
+    in_phrasedoc                 : '${dfs_root}/phrasedoc.gz'
+    in_xdf_extracts              : '${xdf_extract_path}'
+  outputs:
+    out_phrasedoc_with_asin_data : '${dfs_root}/phrasedoc_asin_data_no_text_pipeline.gz'
+  params:
+    job_name                     : '${job_name_prefix}/add_asin_data'
+    mid                          : '${mid}'
+
+# -------------------------------------------------------------------------------------
+# Text pipeline
+# -------------------------------------------------------------------------------------
+- name: tar_text_pipeline_dicts
+  type: local
+  dependencies:
+    - mkdir_local_root_dirs
+  exec: 'tar --create --dereference --gzip'
+  args:
+    '--directory' : '${env_root}/config/build_configuration'
+    '--file'      : '${local_root}/input/text_pipeline_dicts.tar.gz'
+  opts:
+    - 'jp'
+    - 'segmentationdb'
+    - 'stemmingdb'
+    - 'decompositiondb'
+
+- name: dfs_put_text_pipeline_dictionaries
+  type: local
+  dependencies:
+    - tar_text_pipeline_dicts
+    - dfs_mkdir_input
+  exec: 'dfs_put_overwrite'
+  opts:
+    - '${local_root}/input/text_pipeline_dicts.tar.gz'
+    - '${dfs_root}/input/text_pipeline_dicts.tar.gz'
+
+- name: text_pipeline_asin_data
+  type: pig
+  dependencies:
+    - dfs_put_text_pipeline_dictionaries
+    - add_asin_data
+  script: '${env_root}/pig-scripts/text_pipeline_asin_data.pig'
+  inputs:
+    in_phrasedoc_asin_data       : '${dfs_root}/phrasedoc_asin_data_no_text_pipeline.gz'
+  outputs:
+    out_text_pipelined_phrasedoc : '${dfs_root}/phrasedoc_asin_data_no_query_text_pipeline.gz'
+  params:
+    job_name                     : '${job_name_prefix}/text_pipeline_asin_data'
+    lang                         : '${language}'
+    tool_bin                     : 'tp-tool'
+    tool_root                    : '${env_root}/bin'
+    stanza_root                  : '${env_root}/config/stanza'
+    stanza_file                  : 'text_pipeline_tool.stanza'
+    dictionaries                 : '${dfs_root}/input/text_pipeline_dicts.tar.gz#tp_dicts'
+
+- name: text_pipeline_query
+  type: pig
+  dependencies:
+    - text_pipeline_asin_data
+  script: '${env_root}/pig-scripts/text_pipeline_query.pig'
+  inputs:
+    in_phrasedoc                 : '${dfs_root}/phrasedoc_asin_data_no_query_text_pipeline.gz'
+  outputs:
+    out_text_pipelined_phrasedoc : '${dfs_root}/phrasedoc_asin_data.gz'
+  params:
+    job_name                     : '${job_name_prefix}/text_pipeline_query'
+    bytes_per_reducer            : 50000000
+    lang                         : '${language}'
+    tool_root                    : '${env_root}/bin'
+    tool_bin                     : 'tp-tool'
+    stanza_root                  : '${env_root}/config/stanza'
+    stanza_file                  : 'text_pipeline_tool.stanza'
+    dictionaries                 : '${dfs_root}/input/text_pipeline_dicts.tar.gz#tp_dicts'
+
+#--------------------------------------------------------------------------------------
+# Bucket different fields using our competitor association strategy.
+#--------------------------------------------------------------------------------------
+
+- name: calculate_query_asin_overlap_%{bucket}
+  type: pig
+  repeat_for: ${competitor_buckets}
+  dependencies:
+    - text_pipeline_query
+  script: '${env_root}/pig-scripts/calculate_query_asin_overlap.pig'
+  inputs:
+    in_phrasedoc_asin_data       : '${dfs_root}/phrasedoc_asin_data.gz'
+  outputs:
+    out_bucketed_phrasedoc       : '${dfs_root}/query_asin_overlap_%{bucket}.gz'
+  params:
+    job_name                     : '${job_name_prefix}/calculate_query_asin_overlap_%{bucket}'
+    value_field                  : '%{bucket}'
+
+- name: bucket_competitor_%{bucket}
+  type: pig
+  repeat_for: ${competitor_buckets}
+  dependencies:
+    - calculate_query_asin_overlap_%{bucket}
+  script: '${env_root}/pig-scripts/bucket_competitor.pig'
+  inputs:
+    in_bucketed_exact            : '${dfs_root}/query_asin_overlap_%{bucket}.gz'
+    in_asin_to_rep_asin          : '${phrasedoc_dfs_root}/AsinToRepAsin${region}.txt'
+  outputs:
+    out_bucketed_comptetitor     : '${dfs_root}/bucketed_competitor_%{bucket}.gz'
+  params:
+    mid                          : '${mid}'
+    job_name                     : '${job_name_prefix}/bucket_competitor_%{bucket}'
+    bucket_name                  : '%{bucket}'
+
+# -------------------------------------------------------------------------------------
+# Join buckets
+# Bucketed dataset are much smaller than phrasedoc_asin_data dataset.  So to be
+# faster, we first join them together, but one at a time (because pig does not 
+# support lists as parameters and does not support variable number of input 
+# datasets).  We then join dataset with all the buckets onto the original - 
+# phrasedoc_asin_data.gz.
+# An alternative option would be to have one multi join script and then each 
+# time we add a new bucket modify that pig script.  This would be a bad idea
+# because pig is code, while this .yml file is a config and we want to minimize
+# code modifications for each bucket.   Also, it would not be an easy code
+# change, would require unit test changes, and all of this would be very messy. 
+# -------------------------------------------------------------------------------------
+# join_two_bucketed.pig should be run [number of buckets] - 1 times.
+# start with the first bucket and keep adding to it.
+- name: bucket_join_add_%{current_bucket}
+  type: pig
+  repeat_for: ${bucket_join_chain}
+  dependencies:
+    - bucket_%{previous_job}
+    - bucket_competitor_%{current_bucket}
+  script: '${env_root}/pig-scripts/join_two_bucketed.pig'
+  archive: True
+  inputs:
+    in_left_bucketed             : '${dfs_root}/%{previous_data_set}.gz'
+    in_right_bucketed            : '${dfs_root}/bucketed_competitor_%{current_bucket}.gz'
+  outputs:
+    out_joined_bucketed          : '${dfs_root}/bucketed_upto_%{current_bucket}.gz'
+  params:
+    job_name                     : '${job_name_prefix}/bucket_join_add_%{current_bucket}'
+
+# join_original_and_bucketed.pig should be run once after all of buckets were
+# joined by join_two_bucketed.pig runs.
+- name: join_original_and_bucketed
+  type: pig
+  dependencies:
+    - bucket_join_add_${last_bucket_in_join}
+  script: '${env_root}/pig-scripts/join_original_and_bucketed.pig'
+  archive: True
+  inputs:
+    in_phrasedoc_asin_data       : '${dfs_root}/phrasedoc_asin_data.gz'
+    in_bucketed_only_phrasedoc   : '${dfs_root}/bucketed_upto_${last_bucket_in_join}.gz'
+  outputs:
+    out_bucketed_full_phrasedoc  : '${dfs_root}/bucketed_phrasedoc.gz'
+  params:
+    job_name                     : '${job_name_prefix}/join_original_and_bucketed'
+
+# -------------------------------------------------------------------------------------
+# Process the results
+# -------------------------------------------------------------------------------------
+- name: build_dataset_for_widget
+  type: pig
+  dependencies:
+    - join_original_and_bucketed
+  script: '${env_root}/pig-scripts/build_dataset_for_widget.pig'
+  inputs:
+    in_bucketed                  : '${dfs_root}/bucketed_phrasedoc.gz'
+    in_asin_to_rep_asin          : '${phrasedoc_dfs_root}/AsinToRepAsin${region}.txt'
+  outputs:
+    out_competitors              : '${dfs_root}/competitors.tsv'
+    out_summary                  : '${dfs_root}/stats/by_competitor_asins_per_query.gz'
+  params:
+    mid                          : '${mid}'
+    min_score                    : 1
+    min_asins                    : 3
+    translation_config           : '${buckets_to_publish}'
+    job_name                     : '${job_name_prefix}/build_dataset_for_widget'
+
+- name: filter_and_format_for_eds
+  type: pig
+  dependencies:
+    - join_original_and_bucketed
+  script: '${env_root}/pig-scripts/filter_and_format_for_eds.pig'
+  archive: True
+  inputs:
+    in_bucketed                  : '${dfs_root}/bucketed_phrasedoc.gz'
+  outputs:
+    out_filtered_for_eds         : '${dfs_root}/phrasedoc2.gz'
+  params:
+    translation_config           : '${buckets_to_publish}'
+    job_name                     : '${job_name_prefix}/filter_and_format_for_eds'
+
+# This uploads the widget dataset from DFS to S3 and encrypts it using our
+# BDM crypt key.  However, it cannot reaname the file at the same time and it
+# stays 'part-r-00000'.
+# Additionally, the temporary location serves as an archive.
+- name: update_latest_widget_package_update_and_encrypt
+  type: local
+  dependencies:
+    - build_dataset_for_widget
+  exec: 's3distcp'
+  args:
+    '--odin-aws-key'   : '${odin_aws_key}'
+    '--odin-crypt-key' : '${odin_aws_bdm_crypt}'
+  opts:
+    - '${dfs_root}/competitors.tsv/part-r-00000'
+    - 's3://a9-behavior-driven-matching-${stage}/projects/bdm/low-precision-archive/${date}/${region}/${mid}/low-precision.tsv'
+
+# Since the previous step cannot reaname the file (and aws s3 mv can't encrypt)
+# at the same time, we have to do the rename separately here by copying it from
+# our archive.
+- name: update_latest_widget_package_rename_file
+  type: local
+  dependencies:
+    - update_latest_widget_package_update_and_encrypt
+  exec: 'env'
+  opts:
+    - 's3_copy_with_metadata'
+    - '--materialset'
+    - '${odin_aws_key}'
+    - '--sourcebucket'
+    - 'a9-behavior-driven-matching-${stage}'
+    - '--sourcekey'
+    - 'projects/bdm/low-precision-archive/${date}/${region}/${mid}/low-precision.tsv/part-r-00000'
+    - '--targetbucket'
+    - 'a9-behavior-driven-matching-${stage}'
+    - '--targetkey'
+    - 'projects/bdm/widget/${region}/low-precision-${mid}.tsv'
+
+- name: sanity_check
+  type: local
+  dependencies:
+    - dfs_copy_stats_to_local
+    - filter_and_format_for_eds
+  exec: 'sanity_check'
+  opts:
+    - '${local_root}/stats'
+
+- name: mdb_update
+  type: local
+  dependencies:
+    - sanity_check
+    - update_latest_widget_package_rename_file
+  exec: 'mdb update'
+  args:
+    "--mid_list"     : "${mid}"
+    "--client"       : "bdm_bucketer"
+  opts:
+    - ${mdb_url}
+
+# -------------------------------------------------------------------------------------
+# Take stats
+# -------------------------------------------------------------------------------------
+
+# Results will contain the number of asins in original phrasedoc, the number of
+# asins after it got joined with xdf, and the number of asins which do not have
+# main_title field in them (often times this happens if the ASIN is missing from
+# the xdf extracts)
+- name: stats_input_counts
+  type: pig
+  dependencies:
+    - add_asin_data
+  script: '${env_root}/pig-scripts/input_counts.pig'
+  inputs:
+    in_original_phrasedoc       : '${dfs_root}/phrasedoc.gz'
+    in_phrasedoc_asin_data      : '${dfs_root}/phrasedoc_asin_data_no_text_pipeline.gz'
+  outputs:
+    out_counts                  : '${dfs_root}/stats/input_counts.gz'
+  params:
+    job_name                    : '${job_name_prefix}/input_counts'
+    macros_dir                  : '${env_root}/pig-scripts'
+    top_limit                   : 1000
+
+# This will produce two datasets: 
+#   asins_wiht_most_queries: 1000 ASINs which have the largest 
+#     number of queries associated with them
+#   by_queries_per_asin: the first column is a count down from 1 to the largest
+#     number of queries that any ASIN is associated with, the second column
+#     is the number of ASINs associated with that many queries.
+- name: stats_phrasedoc_asin
+  type: pig
+  tags:
+    - ANALYZE_INPUT
+  dependencies:
+    - add_asin_data
+  script: '${env_root}/pig-scripts/phrasedoc_asin_stats.pig'
+  inputs:
+    in_phrasedoc_asin_data      : '${dfs_root}/phrasedoc_asin_data_no_text_pipeline.gz'
+  outputs:
+    out_asins_with_most_queries : '${dfs_root}/stats/asins_with_most_queries.gz'
+    out_by_queries_per_asin     : '${dfs_root}/stats/by_queries_per_asin.gz'
+  params:
+    job_name                    : '${job_name_prefix}/stats_phrasedoc_asin'
+    macros_dir                  : '${env_root}/pig-scripts'
+    top_limit                   : 1000
+
+
+# This job will run for all fields (such as brand, or author) and for each field
+# will produce two datasets: 
+#   by_%{field}_numbers: the first column is a count down from 1 to the number 
+#     of items in this field that the ASIN with most of them holds, the second 
+#     column is the number of ASINs which have this many items in this field
+#   %{field}_outliers: The asins which have more than 4 items in that 
+#     given field.
+- name: stats_%{field}_numbers
+  type: pig
+  repeat_for: ${stats_fields}
+  tags:
+    - ANALYZE_INPUT
+  dependencies:
+    - add_asin_data
+  script: '${env_root}/pig-scripts/asin_data_field_stats.pig'
+  inputs:
+    in_phrasedoc_asin_data      : '${dfs_root}/phrasedoc_asin_data_no_text_pipeline.gz'
+  outputs:
+    out_by_field_numbers        : '${dfs_root}/stats/by_%{field}_numbers.gz'
+    out_outliers                : '${dfs_root}/stats/%{field}_outliers.gz'
+  params:
+    job_name                    : '${job_name_prefix}/stats_%{field}_numbers'
+    macros_dir                  : '${env_root}/pig-scripts'
+    field_name                  : '%{field}'
+    outliers_threshold          : 4
+
+# This stats job will run on the entire input dataset and produce two datasets: 
+#   by_asins_per_query: the first column is a count down from 1 to the number 
+#     of ASINs that a query with most ASINs is associated with
+#   queries_with_most_asins: the top 1000 queries that are associated with most
+#     ASINs
+- name: stats_asins_per_query
+  type: pig
+  tags:
+    - ANALYZE_INPUT
+  dependencies:
+    - text_pipeline_query
+  script: '${env_root}/pig-scripts/asins_per_query_stats.pig'
+  inputs:
+    in_phrasedoc                 : '${dfs_root}/phrasedoc_asin_data.gz'
+  outputs:
+    out_by_asins_per_query       : '${dfs_root}/stats/by_asins_per_query.gz'
+    out_queries_with_most_asins  : '${dfs_root}/stats/queries_with_most_asins.gz'
+  params:
+    job_name                     : '${job_name_prefix}/stats_asins_per_query'
+    macros_dir                   : '${env_root}/pig-scripts'
+    top_limit                    : 1000
+
+# Same as the stats_asins_per_query above, except that it runs on the bucketed 
+# only dataset.
+- name: stats_bucketed_asins_per_query
+  type: pig
+  tags:
+    - ANALYZE_INPUT
+  dependencies:
+    - bucket_join_add_${last_bucket_in_join}
+  script: '${env_root}/pig-scripts/asins_per_query_stats.pig'
+  inputs:
+    in_phrasedoc                 : '${dfs_root}/bucketed_upto_${last_bucket_in_join}.gz'
+  outputs:
+    out_by_asins_per_query       : '${dfs_root}/stats/bucketed_by_asins_per_query.gz'
+    out_queries_with_most_asins  : '${dfs_root}/stats/bucketed_queries_with_most_asins.gz'
+  params:
+    job_name                     : '${job_name_prefix}/stats_bucketed_asins_per_query'
+    macros_dir                   : '${env_root}/pig-scripts'
+    top_limit                    : 1000
+
+# Outputs the counts of query-ASIN associations with given buckets.  Does it per
+# each possible permutation of buckets, including none at all
+- name: stats_bucketed_counts
+  type: pig
+  dependencies:
+    - join_original_and_bucketed
+  script: '${env_root}/pig-scripts/bucketed_stats.pig'
+  inputs:
+    in_bucketed                 : '${dfs_root}/bucketed_phrasedoc.gz'
+  outputs:
+    out_counts                  : '${dfs_root}/stats/bucketed_stats.gz'
+  params:
+    job_name                    : '${job_name_prefix}/stats_bucketed_counts'
+
+# Outputs the number of ASINs in phrasedoc where competitor associations were
+# filtered out.  The count is for ASINs, NOT ASIN-query associations.
+- name: stats_output_counts
+  type: pig
+  dependencies:
+    - filter_and_format_for_eds
+  script: '${env_root}/pig-scripts/output_counts.pig'
+  inputs:
+    in_filtered_for_eds         : '${dfs_root}/phrasedoc2.gz'
+  outputs:
+    out_counts                  : '${dfs_root}/stats/output_counts.gz'
+  params:
+    job_name                    : '${job_name_prefix}/output_counts'
+    macros_dir                  : '${env_root}/pig-scripts'
+
+- name: dfs_copy_stats_to_local
+  type: local
+  dependencies:
+    - stats_.+
+    - build_dataset_for_widget
+  exec: 'dfs_get_overwrite'
+  inputs:
+    in_stats                    : '${dfs_root}/stats'
+  opts:
+    - '${dfs_root}/stats'
+    - '${local_root}/stats'
+
+# -------------------------------------------------------------------------------------
+# Take sample of the given size, given dataset.
+# -------------------------------------------------------------------------------------
+# A sample of all associations, whether they were assigned a bucket or not.
+- name: sample_bucketed
+  type: pig
+  dependencies:
+    - join_original_and_bucketed
+  script: '${env_root}/pig-scripts/take_sample.pig'
+  inputs:
+    in_full_dataset             : '${dfs_root}/bucketed_phrasedoc.gz'
+  outputs:
+    out_sampled_dataset         : '${dfs_root}/sample/pig/bucketed.gz'
+    out_sampled_dataset_csv     : '${dfs_root}/sample/csv/bucketed.gz'
+  params:
+    job_name                    : '${job_name_prefix}/sample_bucketed'
+    sample_size                 : 10000
+
+# A sample of associations deemed for each bucket.
+- name: sample_bucketed_competitor_%{bucket}
+  type: pig
+  repeat_for: ${competitor_buckets}
+  dependencies:
+    - bucket_competitor_%{bucket}
+  script: '${env_root}/pig-scripts/take_sample.pig'
+  inputs:
+    in_full_dataset             : '${dfs_root}/bucketed_competitor_%{bucket}.gz'
+  outputs:
+    out_sampled_dataset         : '${dfs_root}/sample/pig/bucketed_competitor_%{bucket}.gz'
+    out_sampled_dataset_csv     : '${dfs_root}/sample/csv/bucketed_competitor_%{bucket}.gz'
+  params:
+    job_name                    : '${job_name_prefix}/sample_bucketed_competitor_%{bucket}'
+    sample_size                 : 200
+
+- name: dfs_get_samples
+  type: local
+  dependencies:
+    - sample_.+
+  exec: 'dfs_get_overwrite'
+  opts:
+    - '${dfs_root}/sample'
+    - '${local_root}/sample'
+
+# -------------------------------------------------------------------------------------
+# Clean up after all is done
+# ------------------------------------------------------------------------------------
+- name: clean_old_dfs_data
+  type: local
+  dependencies:
+    - mdb_update
+    - dfs_get_samples
+    - dfs_copy_stats_to_local
+  exec: 'dfs_janitor'
+  args: {'--retention-age' : 7 }
+  opts: [ '/projects/bdm/bucketbuilder/bucketer' ]
